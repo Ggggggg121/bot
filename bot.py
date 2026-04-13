@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # Конфигурация
 # ──────────────────────────────────────────────
-BOT_TOKEN = os.environ["8255433252:AAGaRZ1bEKT1nTTFiRn2Q23mpwBjUrNFDms"]
-ADMIN_ID = int(os.environ["1158705019"])
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 STUDENTS_FILE = "students.json"
 QUEUES_FILE = "queues.json"
