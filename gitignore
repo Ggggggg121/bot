@@ -1,0 +1,6 @@
+.env
+queues.json
+__pycache__/
+*.pyc
+.venv/
+venv/
