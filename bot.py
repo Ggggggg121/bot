@@ -1,20 +1,29 @@
+"""
+Бот управления очередями на сдачу лабораторных работ.
+v2.0 — приоритеты, антиспам, честная очистка, extra-очередь, самовыход.
+"""
+
+import asyncio
 import json
 import logging
 import os
 import random
 import time
 from datetime import datetime
+from typing import Optional
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    TypeHandler,
-    filters,
+    CommandHandler,
     ContextTypes,
-    ApplicationHandlerStop,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(
@@ -23,500 +32,838 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Конфигурация
-# ──────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TOKEN_HERE")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
+# ══════════════════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ
+# ══════════════════════════════════════════════════════════════════════
 
-STUDENTS_FILE = "students.json"
-QUEUES_FILE = "queues.json"
-PRIORITIES_FILE = "priorities.json"
-USED_BTN_FILE = "used_buttons.json"  # Защита от спама кнопкой приоритета
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_IDS = set(int(x.strip()) for x in os.environ["ADMIN_IDS"].split(","))
 
 SUBJECTS = ["оаип", "чм", "аисд"]
 SUBGROUPS = ["1", "2"]
-EXTRA_LIMIT = 10
+EXTRA_QUEUE_MAX = 10
 
+# Файлы хранения
+STUDENTS_FILE = "students.json"
+QUEUES_FILE   = "queues.json"
+PRIORITY_FILE = "priority_pool.json"
+EXTRA_FILE    = "extra_queue.json"
+SETTINGS_FILE = "settings.json"
+
+# Ключевые слова для определения предмета
 SUBJECT_KEYWORDS = {
     "оаип": ["оаип"],
-    "чм": ["чм", "числовые методы", "числовых методов"],
+    "чм":   ["чм", "числовые методы", "числовых методов"],
     "аисд": ["аисд"],
 }
 
+# Фразы-триггеры для автозаписи
 QUEUE_TRIGGERS = [
-    "занимаю место на", "займу место на",
-    "записываюсь на", "запишите меня на",
+    "занимаю место на",
+    "займу место на",
+    "записываюсь на",
+    "запишите меня на",
 ]
 
-# ──────────────────────────────────────────────
-# Антиспам система (в оперативной памяти)
-# ──────────────────────────────────────────────
-user_msg_times = {}
-user_mute_level = {}
-user_mute_until = {}
-MUTE_STEPS = [10, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300]
+# Антиспам: уровни мута в секундах
+MUTE_LEVELS = [10, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300]
+SPAM_WINDOW  = 10   # окно в секундах
+SPAM_LIMIT   = 5    # сообщений за окно
 
+# Честная очистка: задержка в секундах (от 0 до 5 минут)
+FAIR_CLEAR_DELAY = 300
 
-async def anti_spam_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.effective_message:
-        return
+# ══════════════════════════════════════════════════════════════════════
+# IN-MEMORY СОСТОЯНИЕ (сбрасывается при рестарте)
+# ══════════════════════════════════════════════════════════════════════
 
-    user_id = update.effective_user.id
-    if user_id == ADMIN_ID:
-        return  # Админ игнорирует лимиты
+# {user_id: {"timestamps": [...], "mute_level": int, "muted_until": float}}
+spam_tracker: dict[int, dict] = {}
 
-    now = time.time()
+# {clear_key: asyncio.Task}
+pending_clears: dict[str, asyncio.Task] = {}
 
-    # Проверка текущего мута
-    if user_id in user_mute_until and now < user_mute_until[user_id]:
-        raise ApplicationHandlerStop()
+# ══════════════════════════════════════════════════════════════════════
+# ХРАНИЛИЩЕ
+# ══════════════════════════════════════════════════════════════════════
 
-    # Сбор статистики сообщений
-    if user_id not in user_msg_times:
-        user_msg_times[user_id] = []
+def _load(path: str, default_factory):
+    if not os.path.exists(path):
+        return default_factory()
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    user_msg_times[user_id].append(now)
-    # Оставляем только сообщения за последние 10 секунд
-    user_msg_times[user_id] = [t for t in user_msg_times[user_id] if now - t <= 10]
-
-    # Если больше 5 сообщений за 10 сек -> Мут
-    if len(user_msg_times[user_id]) > 5:
-        level = user_mute_level.get(user_id, 0)
-        mute_duration = MUTE_STEPS[min(level, len(MUTE_STEPS) - 1)]
-
-        user_mute_until[user_id] = now + mute_duration
-        user_mute_level[user_id] = level + 1
-        user_msg_times[user_id] = []  # Сброс счетчика
-
-        await update.effective_message.reply_text(
-            f"🛑 *Сработала защита от спама!*\n"
-            f"Вы добавлены в мут бота на *{mute_duration} секунд*.",
-            parse_mode="Markdown"
-        )
-        raise ApplicationHandlerStop()
-
-
-# ──────────────────────────────────────────────
-# Работа с данными
-# ──────────────────────────────────────────────
-def load_json(filepath: str, default: dict) -> dict:
-    if not os.path.exists(filepath):
-        return default
-    with open(filepath, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return default
-
-
-def save_json(filepath: str, data: dict) -> None:
-    with open(filepath, "w", encoding="utf-8") as f:
+def _save(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
 def load_students() -> dict:
-    return load_json(STUDENTS_FILE, {})
-
+    return _load(STUDENTS_FILE, dict)
 
 def load_queues() -> dict:
-    default_queues = {"subjects": {s: {"1": [], "2": []} for s in SUBJECTS}, "extra": []}
-    data = load_json(QUEUES_FILE, default_queues)
-    if "subjects" not in data:  # Миграция со старого формата
-        return {"subjects": data, "extra": []}
-    return data
+    return _load(QUEUES_FILE, lambda: {s: {"1": [], "2": []} for s in SUBJECTS})
+
+def save_queues(d): _save(QUEUES_FILE, d)
+
+def load_priority() -> dict:
+    return _load(PRIORITY_FILE, lambda: {s: {"1": [], "2": []} for s in SUBJECTS})
+
+def save_priority(d): _save(PRIORITY_FILE, d)
+
+def load_extra() -> list:
+    return _load(EXTRA_FILE, list)
+
+def save_extra(d): _save(EXTRA_FILE, d)
+
+def load_settings() -> dict:
+    return _load(SETTINGS_FILE, lambda: {"group_chats": []})
+
+def save_settings(d): _save(SETTINGS_FILE, d)
+
+def register_chat(chat_id: int) -> None:
+    """Запомнить chat_id группы для отправки уведомлений."""
+    s = load_settings()
+    if chat_id not in s["group_chats"]:
+        s["group_chats"].append(chat_id)
+        save_settings(s)
+
+# ══════════════════════════════════════════════════════════════════════
+# АНТИСПАМ
+# ══════════════════════════════════════════════════════════════════════
+
+def check_spam(user_id: int) -> tuple[bool, int]:
+    """
+    Возвращает (is_muted, seconds).
+    Обновляет трекер и назначает мут при превышении лимита.
+    """
+    now = time.monotonic()
+    info = spam_tracker.setdefault(
+        user_id,
+        {"timestamps": [], "mute_level": 0, "muted_until": 0.0},
+    )
+
+    # Уже в муте?
+    if info["muted_until"] > now:
+        return True, int(info["muted_until"] - now)
+
+    # Убираем старые метки
+    info["timestamps"] = [t for t in info["timestamps"] if now - t < SPAM_WINDOW]
+    info["timestamps"].append(now)
+
+    if len(info["timestamps"]) > SPAM_LIMIT:
+        level = min(info["mute_level"], len(MUTE_LEVELS) - 1)
+        duration = MUTE_LEVELS[level]
+        info["muted_until"] = now + duration
+        info["mute_level"]  = min(info["mute_level"] + 1, len(MUTE_LEVELS) - 1)
+        info["timestamps"]  = []
+        return True, duration
+
+    return False, 0
+
+# ══════════════════════════════════════════════════════════════════════
+# ЛОГИКА ОЧЕРЕДИ
+# ══════════════════════════════════════════════════════════════════════
+
+def interleave(queue: list) -> list:
+    """
+    Чередует приоритетных и обычных: П, О, П, О, ...
+    Среди приоритетных: сначала с бо́льшим уровнем.
+    """
+    priority = sorted(
+        [e for e in queue if e.get("priority", 0) > 0],
+        key=lambda x: -x["priority"],
+    )
+    regular = [e for e in queue if e.get("priority", 0) == 0]
+    result, pi, ri = [], 0, 0
+    while pi < len(priority) or ri < len(regular):
+        if pi < len(priority):
+            result.append(priority[pi]); pi += 1
+        if ri < len(regular):
+            result.append(regular[ri]); ri += 1
+    return result
 
 
-def save_queues(queues: dict) -> None:
-    save_json(QUEUES_FILE, queues)
+def detect_subject(text: str) -> Optional[str]:
+    t = text.lower()
+    for subj, keywords in SUBJECT_KEYWORDS.items():
+        if any(kw in t for kw in keywords):
+            return subj
+    return None
 
 
-def load_priorities() -> dict:
-    return load_json(PRIORITIES_FILE, {s: {} for s in SUBJECTS})
+def is_trigger(text: str) -> bool:
+    t = text.lower()
+    return any(tr in t for tr in QUEUE_TRIGGERS)
 
 
-def save_priorities(priorities: dict) -> None:
-    save_json(PRIORITIES_FILE, priorities)
+def _fmt_entry(i: int, entry: dict) -> str:
+    p = entry.get("priority", 0)
+    star = f" ⭐×{p}" if p > 0 else ""
+    return f"    {i}. {entry['name']}{star}  ·  {entry['time']}"
 
 
-def load_used_btns() -> dict:
-    return load_json(USED_BTN_FILE, {s: [] for s in SUBJECTS})
-
-
-def save_used_btns(data: dict) -> None:
-    save_json(USED_BTN_FILE, data)
-
-
-def get_student(user_id: int, students: dict) -> dict | None:
-    return students.get(str(user_id))
-
-
-def get_next_pos(queue: list) -> int:
-    """Находит первое свободное место в очереди"""
-    occupied = {e.get('pos', 0) for e in queue}
-    pos = 1
-    while pos in occupied:
-        pos += 1
-    return pos
-
-
-# ──────────────────────────────────────────────
-# Форматирование и Вывод
-# ──────────────────────────────────────────────
-def format_queue_message(queues: dict) -> str:
+def format_all_queues(queues: dict, extra: list) -> str:
     lines = ["📋 *Текущие очереди на сдачу лаб:*\n"]
-    for subject in SUBJECTS:
-        lines.append(f"━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📚 *{subject.upper()}*")
-        for sub in SUBGROUPS:
-            queue = sorted(queues["subjects"][subject][sub], key=lambda x: x.get('pos', 999))
-            lines.append(f"  👥 Подгруппа {sub}:")
-            if not queue:
-                lines.append("    — очередь пуста")
+    for subj in SUBJECTS:
+        lines.append("━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📚 *{subj.upper()}*")
+        for sg in SUBGROUPS:
+            ordered = interleave(queues[subj][sg])
+            lines.append(f"  👥 Подгруппа {sg}:")
+            if not ordered:
+                lines.append("    — пусто")
             else:
-                for entry in queue:
-                    marker = "🔥" if "Приоритет" in entry['name'] else "👤"
-                    lines.append(f"    [{entry.get('pos', '?')}] {marker} {entry['name']}  ·  {entry['time']}")
+                for i, e in enumerate(ordered, 1):
+                    lines.append(_fmt_entry(i, e))
         lines.append("")
 
-    # Extra очередь
-    lines.append(f"━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🎓 *EXTRA-ОЧЕРЕДЬ (внеучебная)* [{len(queues['extra'])}/{EXTRA_LIMIT}]")
-    if not queues['extra']:
-        lines.append("    — очередь пуста")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🎓 *Extra-очередь* ({len(extra)}/{EXTRA_QUEUE_MAX}):")
+    if not extra:
+        lines.append("    — пусто")
     else:
-        for i, entry in enumerate(queues['extra'], 1):
-            lines.append(f"    {i}. {entry['name']}  ·  {entry['time']}")
+        for i, e in enumerate(extra, 1):
+            lines.append(_fmt_entry(i, e))
 
     return "\n".join(lines)
 
+# ══════════════════════════════════════════════════════════════════════
+# КЛАВИАТУРЫ
+# ══════════════════════════════════════════════════════════════════════
 
-def get_queue_keyboard():
-    keyboard = []
-    row = []
+def main_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+    rows = []
     for subj in SUBJECTS:
-        row.append(InlineKeyboardButton(f"❌ Не сдал {subj.upper()}", callback_data=f"missed_{subj}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    return InlineKeyboardMarkup(keyboard)
+        rows.append([
+            InlineKeyboardButton(
+                f"😞 Не успел: {subj.upper()}",
+                callback_data=f"miss:{subj}",
+            ),
+            InlineKeyboardButton(
+                f"🚪 Выйти: {subj.upper()}",
+                callback_data=f"leave:{subj}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton("📝 Extra: записаться",  callback_data="extra:join"),
+        InlineKeyboardButton("🚪 Extra: выйти",       callback_data="extra:leave"),
+    ])
+    if is_admin:
+        rows.append([
+            InlineKeyboardButton("🔧 Панель управления", callback_data="admin:panel"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
-# ──────────────────────────────────────────────
-# Логика Очередей и Приоритетов
-# ──────────────────────────────────────────────
-async def _enqueue(update: Update, subject: str, user_id: int, student: dict) -> None:
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🗑 Очистить ВСЁ", callback_data="clear:all:")],
+    ]
+    for subj in SUBJECTS:
+        rows.append([
+            InlineKeyboardButton(f"🗑 {subj.upper()} (обе)", callback_data=f"clear:{subj}:"),
+            InlineKeyboardButton(f"🗑 {subj.upper()} пг.1",  callback_data=f"clear:{subj}:1"),
+            InlineKeyboardButton(f"🗑 {subj.upper()} пг.2",  callback_data=f"clear:{subj}:2"),
+        ])
+    rows.append([
+        InlineKeyboardButton("🗑 Extra-очередь", callback_data="clear:extra:"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⛔ Отмена запланированных", callback_data="admin:cancel_clears"),
+        InlineKeyboardButton("❌ Закрыть",                callback_data="admin:close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+# ══════════════════════════════════════════════════════════════════════
+# УВЕДОМЛЕНИЯ
+# ══════════════════════════════════════════════════════════════════════
+
+async def broadcast(app: Application, text: str) -> None:
+    """Отправить сообщение во все известные групповые чаты."""
+    settings = load_settings()
+    for chat_id in settings.get("group_chats", []):
+        try:
+            await app.bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as exc:
+            logger.warning("broadcast failed for %s: %s", chat_id, exc)
+
+# ══════════════════════════════════════════════════════════════════════
+# ЧЕСТНАЯ ОЧИСТКА
+# ══════════════════════════════════════════════════════════════════════
+
+def _clear_key(subject: Optional[str], subgroup: Optional[str]) -> str:
+    return f"{subject or 'all'}:{subgroup or ''}"
+
+
+async def _execute_clear(
+    app: Application,
+    subject: Optional[str],
+    subgroup: Optional[str],
+) -> None:
+    """
+    Выполняет очистку:
+    1. Последние 3 в каждой затронутой очереди → priority_pool (+1 к уровню).
+    2. Очередь очищается.
+    3. Люди из priority_pool сразу ставятся на первые места (interleave).
+    4. Уведомление в группу.
+    """
+    key = _clear_key(subject, subgroup)
+    queues  = load_queues()
+    priority = load_priority()
+    notified_names: list[str] = []
+
+    def _process(s: str, sg: str) -> None:
+        q = queues[s][sg]
+        if not q:
+            return
+
+        notified_names.extend(e["name"] for e in q)
+
+        # ── Последние 3 → в пул приоритетов
+        tail = q[-3:] if len(q) >= 3 else q[:]
+        pool = priority[s][sg]
+        pool_index = {pe["user_id"]: idx for idx, pe in enumerate(pool)}
+
+        for entry in tail:
+            uid = entry["user_id"]
+            if uid in pool_index:
+                pool[pool_index[uid]]["priority_level"] += 1
+            else:
+                pool.append({
+                    "user_id":        uid,
+                    "name":           entry["name"],
+                    "priority_level": 1,
+                })
+
+        # ── Собрать новую очередь из пула приоритетов (interleave-ready)
+        new_queue = [
+            {
+                "user_id":  pe["user_id"],
+                "name":     pe["name"],
+                "time":     datetime.now().strftime("%H:%M  %d.%m.%Y"),
+                "priority": pe["priority_level"],
+            }
+            for pe in sorted(pool, key=lambda x: -x["priority_level"])
+        ]
+
+        queues[s][sg]   = new_queue
+        priority[s][sg] = []   # пул применён — сбросить
+
+    # ── Extra-очередь
+    if subject == "extra":
+        extra = load_extra()
+        notified_names.extend(e["name"] for e in extra)
+        save_extra([])
+        pending_clears.pop(key, None)
+        await broadcast(app, "🔔 *Extra-очередь* очищена.")
+        return
+
+    # ── Основные очереди
+    if subject and subgroup:
+        _process(subject, subgroup)
+        label = f"*{subject.upper()}* (подгруппа {subgroup})"
+    elif subject:
+        for sg in SUBGROUPS:
+            _process(subject, sg)
+        label = f"*{subject.upper()}* (обе подгруппы)"
+    else:
+        for s in SUBJECTS:
+            for sg in SUBGROUPS:
+                _process(s, sg)
+        label = "*все очереди*"
+
+    save_queues(queues)
+    save_priority(priority)
+    pending_clears.pop(key, None)
+
+    # ── Список имён для уведомления
+    unique_names = list(dict.fromkeys(notified_names))   # сохранить порядок, убрать дубли
+    names_str = (
+        "\n".join(f"• {n}" for n in unique_names)
+        if unique_names else "— очереди были пусты"
+    )
+
+    await broadcast(
+        app,
+        f"🔔 Очищены {label}.\n\n"
+        f"Люди с приоритетом автоматически поставлены в начало новой очереди.\n\n"
+        f"*Были в очереди:*\n{names_str}",
+    )
+
+
+async def schedule_clear(
+    app: Application,
+    subject: Optional[str],
+    subgroup: Optional[str],
+) -> int:
+    """
+    Планирует очистку через случайное время [1, FAIR_CLEAR_DELAY] секунд.
+    Возвращает задержку или -1 если уже запланировано.
+    """
+    key = _clear_key(subject, subgroup)
+
+    if key in pending_clears and not pending_clears[key].done():
+        return -1
+
+    delay = random.randint(1, FAIR_CLEAR_DELAY)
+
+    async def _run():
+        await asyncio.sleep(delay)
+        await _execute_clear(app, subject, subgroup)
+
+    pending_clears[key] = asyncio.create_task(_run())
+    return delay
+
+# ══════════════════════════════════════════════════════════════════════
+# ЗАПИСЬ В ОЧЕРЕДЬ
+# ══════════════════════════════════════════════════════════════════════
+
+async def do_enqueue(
+    update: Update,
+    subject: str,
+    user_id: int,
+    student: dict,
+) -> None:
     subgroup = str(student["subgroup"])
     name = f"{student['name']} {student['surname']}"
 
     queues = load_queues()
-    queue = queues["subjects"][subject][subgroup]
+    queue  = queues[subject][subgroup]
 
     if any(e["user_id"] == user_id for e in queue):
-        await update.message.reply_text(
-            f"⚠️ *{name}*, ты уже в очереди на *{subject.upper()}* (подгруппа {subgroup}).",
-            parse_mode="Markdown"
+        await update.effective_message.reply_text(
+            f"⚠️ *{name}*, ты уже в очереди на *{subject.upper()}* (пг. {subgroup}).",
+            parse_mode="Markdown",
         )
         return
 
-    pos = get_next_pos(queue)
+    # Перенести приоритет из пула (если есть)
+    priority_data = load_priority()
+    pool = priority_data[subject][subgroup]
+    user_priority = 0
+    priority_data[subject][subgroup] = []
+    for pe in pool:
+        if pe["user_id"] == user_id:
+            user_priority = pe["priority_level"]
+        else:
+            priority_data[subject][subgroup].append(pe)
+    save_priority(priority_data)
+
     entry = {
-        "user_id": user_id,
-        "name": name,
-        "time": datetime.now().strftime("%H:%M %d.%m"),
-        "pos": pos
+        "user_id":  user_id,
+        "name":     name,
+        "time":     datetime.now().strftime("%H:%M  %d.%m.%Y"),
+        "priority": user_priority,
     }
-    queues["subjects"][subject][subgroup].append(entry)
+    queues[subject][subgroup].append(entry)
     save_queues(queues)
 
-    await update.message.reply_text(
-        f"✅ *{name}* занял(а) место *№{pos}* на *{subject.upper()}*\n"
-        f"Подгруппа: {subgroup} | {entry['time']}",
+    ordered = interleave(queues[subject][subgroup])
+    pos = next((i + 1 for i, e in enumerate(ordered) if e["user_id"] == user_id), len(ordered))
+    prio_str = f"  |  ⭐ Приоритет: {user_priority}" if user_priority > 0 else ""
+
+    await update.effective_message.reply_text(
+        f"✅ *{name}* записан(а) на *{subject.upper()}*\n"
+        f"Пг. {subgroup}  |  Позиция: *{pos}*{prio_str}  |  {entry['time']}",
+        parse_mode="Markdown",
+    )
+
+# ══════════════════════════════════════════════════════════════════════
+# ОБЩИЕ КОМАНДЫ
+# ══════════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "👋 *Бот управления очередями на сдачу лаб*\n\n"
+        "📌 *Записаться* — напиши в группе:\n"
+        "`занимаю место на оаип` (или чм / аисд)\n\n"
+        "📋 /queue — очереди + кнопки управления\n\n"
+        "➕ *Принудительная запись:*\n"
+        "/add\\_oaip · /add\\_chm · /add\\_aisd\n\n"
+        "🔧 *Только для администраторов:*\n"
+        "/remove `<предмет> <пг> <user_id>` — убрать из очереди\n"
+        "/cancel\\_clears — отменить запланированные очистки\n\n"
+        "ℹ️ Кнопки в /queue:\n"
+        "• *Не успел* — получить приоритет на следующую сессию\n"
+        "• *Выйти* — самостоятельно покинуть очередь\n"
+        "• *Extra* — очередь на внеплановую сдачу лаб (макс. 10)",
         parse_mode="Markdown",
     )
 
 
-async def btn_missed_lab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    subject = query.data.split("_")[1]
-    user_id = query.from_user.id
-
-    students = load_students()
-    if not get_student(user_id, students):
-        await query.message.reply_text("❌ Твой ID не найден в базе студентов.")
-        return
-
-    used_btns = load_used_btns()
-    if user_id in used_btns[subject]:
-        await query.message.reply_text(f"⚠️ Ты уже запрашивал приоритет на {subject.upper()} в этом цикле!")
-        return
-
-    # Начисляем приоритет
-    priorities = load_priorities()
-    uid_str = str(user_id)
-    priorities[subject][uid_str] = priorities[subject].get(uid_str, 0) + 1
-
-    # Фиксируем нажатие
-    used_btns[subject].append(user_id)
-
-    save_priorities(priorities)
-    save_used_btns(used_btns)
-
-    await query.message.reply_text(
-        f"🔥 Приоритет на *{subject.upper()}* повышен! При следующей очистке ты займешь первые места.",
-        parse_mode="Markdown")
-
-
-# ──────────────────────────────────────────────
-# Команды пользователей
-# ──────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 *Бот управления очередями*\n\n"
-        "Записаться: `занимаю место на оаип`\n"
-        "Выйти: `/leave оаип`\n"
-        "Extra-очередь: `/extra` (выйти: `/leave_extra`)\n\n"
-        "📋 Посмотреть очереди: /queue",
-        parse_mode="Markdown"
-    )
-
-
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message and update.message.chat.type in ("group", "supergroup"):
+        register_chat(update.message.chat_id)
+
     queues = load_queues()
-    await update.message.reply_text(
-        format_queue_message(queues),
-        reply_markup=get_queue_keyboard(),
-        parse_mode="Markdown"
+    extra  = load_extra()
+    text   = format_all_queues(queues, extra)
+    is_admin = update.effective_user.id in ADMIN_IDS
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(is_admin),
     )
 
+# ══════════════════════════════════════════════════════════════════════
+# ПАРСИНГ СООБЩЕНИЙ ГРУППЫ
+# ══════════════════════════════════════════════════════════════════════
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text.lower()
-    if not any(trigger in text for trigger in QUEUE_TRIGGERS):
-        return
+    if update.message.chat.type in ("group", "supergroup"):
+        register_chat(update.message.chat_id)
 
-    subject = next((s for s, kw in SUBJECT_KEYWORDS.items() if any(k in text for k in kw)), None)
-    if not subject:
+    text = update.message.text
+    if not is_trigger(text):
         return
 
     user_id = update.message.from_user.id
-    student = get_student(user_id, load_students())
 
+    # ── Антиспам
+    muted, secs = check_spam(user_id)
+    if muted:
+        await update.message.reply_text(
+            f"🚫 Слишком много запросов. Подожди *{secs} сек.*",
+            parse_mode="Markdown",
+        )
+        return
+
+    subject = detect_subject(text)
+    if not subject:
+        await update.message.reply_text(
+            "❓ Не могу определить предмет.\n"
+            "Используй: /add\\_oaip | /add\\_chm | /add\\_aisd",
+            parse_mode="Markdown",
+        )
+        return
+
+    students = load_students()
+    student = students.get(str(user_id))
     if not student:
-        await update.message.reply_text("❌ ID не найден в базе студентов.")
+        await update.message.reply_text(
+            "❌ Твой Telegram ID не найден в базе. Обратись к администратору."
+        )
         return
 
-    await _enqueue(update, subject, user_id, student)
+    await do_enqueue(update, subject, user_id, student)
 
+# ══════════════════════════════════════════════════════════════════════
+# ПРИНУДИТЕЛЬНАЯ ЗАПИСЬ (резервные команды)
+# ══════════════════════════════════════════════════════════════════════
 
-async def cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Использование: `/leave <предмет>`", parse_mode="Markdown")
+async def _force_add(update: Update, context: ContextTypes.DEFAULT_TYPE, subject: str) -> None:
+    caller_id = update.effective_user.id
+    students  = load_students()
+
+    # Антиспам для команд записи
+    muted, secs = check_spam(caller_id)
+    if muted:
+        await update.effective_message.reply_text(
+            f"🚫 Слишком много запросов. Подожди *{secs} сек.*",
+            parse_mode="Markdown",
+        )
         return
 
-    subject = context.args[0].lower()
-    if subject not in SUBJECTS:
+    target_id = caller_id
+    if context.args:
+        if caller_id not in ADMIN_IDS:
+            await update.effective_message.reply_text("❌ Только администратор может записывать других.")
+            return
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("❌ Неверный user_id.")
+            return
+
+    student = students.get(str(target_id))
+    if not student:
+        await update.effective_message.reply_text(
+            f"❌ ID `{target_id}` не найден в базе.", parse_mode="Markdown"
+        )
         return
 
-    user_id = update.effective_user.id
-    student = get_student(user_id, load_students())
-    if not student: return
-
-    subgroup = str(student["subgroup"])
-    queues = load_queues()
-    queue = queues["subjects"][subject][subgroup]
-
-    new_queue = [e for e in queue if e["user_id"] != user_id]
-    if len(new_queue) == len(queue):
-        await update.message.reply_text("⚠️ Вас нет в этой очереди.")
-        return
-
-    queues["subjects"][subject][subgroup] = new_queue
-    save_queues(queues)
-    await update.message.reply_text(f"✅ Вы покинули очередь по {subject.upper()}. Место освободилось.")
+    await do_enqueue(update, subject, target_id, student)
 
 
-# --- Extra Queue ---
-async def cmd_extra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    student = get_student(user_id, load_students())
-    if not student: return
+async def cmd_add_oaip(u, c): await _force_add(u, c, "оаип")
+async def cmd_add_chm(u, c):  await _force_add(u, c, "чм")
+async def cmd_add_aisd(u, c): await _force_add(u, c, "аисд")
 
-    queues = load_queues()
-    if any(e["user_id"] == user_id for e in queues["extra"]):
-        await update.message.reply_text("⚠️ Вы уже в Extra-очереди.")
-        return
+# ══════════════════════════════════════════════════════════════════════
+# КОМАНДЫ АДМИНИСТРАТОРА
+# ══════════════════════════════════════════════════════════════════════
 
-    if len(queues["extra"]) >= EXTRA_LIMIT:
-        await update.message.reply_text("❌ Extra-очередь переполнена (максимум 10 человек).")
-        return
-
-    name = f"{student['name']} {student['surname']}"
-    queues["extra"].append({
-        "user_id": user_id,
-        "name": name,
-        "time": datetime.now().strftime("%H:%M")
-    })
-    save_queues(queues)
-    await update.message.reply_text(f"✅ {name} записан в Extra-очередь на позицию {len(queues['extra'])}.")
-
-
-async def cmd_leave_extra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    queues = load_queues()
-    new_extra = [e for e in queues["extra"] if e["user_id"] != user_id]
-
-    if len(new_extra) == len(queues["extra"]):
-        await update.message.reply_text("⚠️ Вас нет в Extra-очереди.")
-        return
-
-    queues["extra"] = new_extra
-    save_queues(queues)
-    await update.message.reply_text("✅ Вы покинули Extra-очередь.")
-
-
-# ──────────────────────────────────────────────
-# Логика Честной Очистки (Админ)
-# ──────────────────────────────────────────────
-def _admin_only(func):
+def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Доступ запрещен.")
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.effective_message.reply_text("❌ Недостаточно прав.")
             return
         await func(update, context)
-
     return wrapper
 
 
-async def execute_clear_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фоновая задача честной очистки очереди"""
-    data = context.job.data
-    subject = data['subject']
-    subgroup = data['subgroup']
-    chat_id = data['chat_id']
-
-    queues = load_queues()
-    priorities = load_priorities()
-    students = load_students()
-    used_btns = load_used_btns()
-
-    queue = queues["subjects"][subject][subgroup]
-
-    # 1. Выдаем приоритет последним 3 людям перед удалением
-    queue_sorted = sorted(queue, key=lambda x: x.get('pos', 999))
-    for entry in queue_sorted[-3:]:
-        uid_str = str(entry["user_id"])
-        priorities[subject][uid_str] = priorities[subject].get(uid_str, 0) + 1
-
-    # 2. Очищаем саму очередь
-    queues["subjects"][subject][subgroup] = []
-
-    # Сбрасываем кулдаун кнопки "Не успел" для предмета
-    used_btns[subject] = []
-    save_used_btns(used_btns)
-
-    # 3. Распределяем места приоритетникам
-    prio_users = []
-    for uid_str, prio in priorities[subject].items():
-        if prio > 0:
-            student = get_student(int(uid_str), students)
-            if student and str(student['subgroup']) == subgroup:
-                prio_users.append({
-                    "uid": int(uid_str),
-                    "prio": prio,
-                    "name": f"{student['name']} {student['surname']}"
-                })
-
-    # Сортируем: у кого больше приоритет - тот выше
-    prio_users.sort(key=lambda x: x['prio'], reverse=True)
-
-    # Назначаем позиции через одну: 1, 3, 5, 7...
-    pos = 1
-    for p_user in prio_users:
-        queues["subjects"][subject][subgroup].append({
-            "user_id": p_user["uid"],
-            "name": f"{p_user['name']} [Приоритет]",
-            "time": "Авто",
-            "pos": pos
-        })
-        # Сбрасываем приоритет после успешного применения
-        priorities[subject][str(p_user["uid"])] = 0
-        pos += 2
-
-    save_queues(queues)
-    save_priorities(priorities)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔄 *Очередь на {subject.upper()} (подгр. {subgroup}) очищена!*\n"
-             f"Приоритетные места распределены автоматически. Можно занимать пустые слоты.",
-        parse_mode="Markdown"
-    )
-
-
-@_admin_only
-async def cmd_clear_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Использование: `/clear <предмет> [подгруппа]`", parse_mode="Markdown")
+@admin_only
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/remove <предмет> <пг> <user_id>"""
+    if len(context.args) < 3:
+        await update.effective_message.reply_text(
+            "Использование: `/remove <предмет> <пг> <user_id>`\n"
+            "Пример: `/remove оаип 1 123456789`",
+            parse_mode="Markdown",
+        )
         return
 
-    subject = context.args[0].lower()
-    if subject not in SUBJECTS: return
+    subject  = context.args[0].lower()
+    subgroup = context.args[1]
 
-    subgroups_to_clear = [context.args[1]] if len(context.args) > 1 else SUBGROUPS
+    if subject not in SUBJECTS:
+        await update.effective_message.reply_text(f"❌ Предмет: `{', '.join(SUBJECTS)}`", parse_mode="Markdown")
+        return
+    if subgroup not in SUBGROUPS:
+        await update.effective_message.reply_text("❌ Подгруппа должна быть 1 или 2.")
+        return
+    try:
+        target_id = int(context.args[2])
+    except ValueError:
+        await update.effective_message.reply_text("❌ user_id должен быть числом.")
+        return
 
-    delay = random.randint(30, 300)  # Случайная задержка от 30 сек до 5 минут
+    queues = load_queues()
+    old_len = len(queues[subject][subgroup])
+    queues[subject][subgroup] = [e for e in queues[subject][subgroup] if e["user_id"] != target_id]
 
-    for sg in subgroups_to_clear:
-        if sg in SUBGROUPS:
-            context.job_queue.run_once(
-                execute_clear_job,
-                when=delay,
-                data={"subject": subject, "subgroup": sg, "chat_id": update.effective_chat.id}
-            )
+    if len(queues[subject][subgroup]) == old_len:
+        await update.effective_message.reply_text("❌ Пользователь не найден в этой очереди.")
+        return
 
-    await update.message.reply_text(
-        f"⏳ Запущена честная очистка *{subject.upper()}*.\n"
-        f"Очередь сбросится и пересчитается в случайное время в течение 5 минут. Всем придет уведомление.",
-        parse_mode="Markdown"
+    save_queues(queues)
+    await update.effective_message.reply_text(
+        f"✅ `{target_id}` удалён из *{subject.upper()}* (пг. {subgroup}). Очередь сдвинута.",
+        parse_mode="Markdown",
     )
 
 
-# ──────────────────────────────────────────────
-# Запуск
-# ──────────────────────────────────────────────
+@admin_only
+async def cmd_cancel_clears(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel_clears — отменить все запланированные очистки."""
+    cancelled = 0
+    for key, task in list(pending_clears.items()):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+        pending_clears.pop(key, None)
+
+    await update.effective_message.reply_text(
+        f"✅ Отменено запланированных очисток: *{cancelled}*.", parse_mode="Markdown"
+    )
+
+# ══════════════════════════════════════════════════════════════════════
+# ОБРАБОТЧИК INLINE-КНОПОК
+# ══════════════════════════════════════════════════════════════════════
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    user_id = query.from_user.id
+    data    = query.data
+
+    await query.answer()   # убрать "часики" у кнопки
+
+    # ── Не успел сдать (приоритет) ───────────────────────────────────
+    if data.startswith("miss:"):
+        subject = data.split(":")[1]
+
+        # Антиспам на кнопки
+        muted, secs = check_spam(user_id)
+        if muted:
+            await query.answer(f"🚫 Мут {secs} сек. за спам.", show_alert=True)
+            return
+
+        students = load_students()
+        student  = students.get(str(user_id))
+        if not student:
+            await query.answer("❌ Твой ID не найден в базе.", show_alert=True)
+            return
+
+        subgroup = str(student["subgroup"])
+        name     = f"{student['name']} {student['surname']}"
+        priority = load_priority()
+        pool     = priority[subject][subgroup]
+
+        existing = next((pe for pe in pool if pe["user_id"] == user_id), None)
+        if existing:
+            existing["priority_level"] += 1
+            level = existing["priority_level"]
+        else:
+            pool.append({"user_id": user_id, "name": name, "priority_level": 1})
+            level = 1
+
+        save_priority(priority)
+        await query.answer(
+            f"⭐ Приоритет на {subject.upper()} → уровень {level}.\n"
+            f"При следующей сессии попадёшь в начало очереди.",
+            show_alert=True,
+        )
+
+    # ── Самостоятельный выход из очереди ─────────────────────────────
+    elif data.startswith("leave:"):
+        subject  = data.split(":")[1]
+        students = load_students()
+        student  = students.get(str(user_id))
+        if not student:
+            await query.answer("❌ Твой ID не найден.", show_alert=True)
+            return
+
+        subgroup = str(student["subgroup"])
+        queues   = load_queues()
+        old_len  = len(queues[subject][subgroup])
+        queues[subject][subgroup] = [
+            e for e in queues[subject][subgroup] if e["user_id"] != user_id
+        ]
+
+        if len(queues[subject][subgroup]) == old_len:
+            await query.answer(f"ℹ️ Ты не записан(а) на {subject.upper()}.", show_alert=True)
+            return
+
+        save_queues(queues)
+        student_name = f"{student['name']} {student['surname']}"
+        await query.answer(
+            f"✅ {student_name} вышел(а) из очереди {subject.upper()}.",
+            show_alert=True,
+        )
+
+    # ── Extra-очередь: записаться ─────────────────────────────────────
+    elif data == "extra:join":
+        muted, secs = check_spam(user_id)
+        if muted:
+            await query.answer(f"🚫 Мут {secs} сек.", show_alert=True)
+            return
+
+        students = load_students()
+        student  = students.get(str(user_id))
+        if not student:
+            await query.answer("❌ Твой ID не найден.", show_alert=True)
+            return
+
+        extra = load_extra()
+        if any(e["user_id"] == user_id for e in extra):
+            await query.answer("⚠️ Ты уже в Extra-очереди.", show_alert=True)
+            return
+        if len(extra) >= EXTRA_QUEUE_MAX:
+            await query.answer(f"❌ Extra-очередь заполнена ({EXTRA_QUEUE_MAX}/{EXTRA_QUEUE_MAX}).", show_alert=True)
+            return
+
+        name = f"{student['name']} {student['surname']}"
+        extra.append({
+            "user_id":  user_id,
+            "name":     name,
+            "time":     datetime.now().strftime("%H:%M  %d.%m.%Y"),
+            "priority": 0,
+        })
+        save_extra(extra)
+        await query.answer(f"✅ Записан(а) в Extra-очередь! Позиция: {len(extra)}", show_alert=True)
+
+    # ── Extra-очередь: выйти ──────────────────────────────────────────
+    elif data == "extra:leave":
+        extra     = load_extra()
+        new_extra = [e for e in extra if e["user_id"] != user_id]
+        if len(new_extra) == len(extra):
+            await query.answer("ℹ️ Ты не в Extra-очереди.", show_alert=True)
+            return
+        save_extra(new_extra)
+        await query.answer("✅ Ты вышел(а) из Extra-очереди.", show_alert=True)
+
+    # ── Панель администратора ─────────────────────────────────────────
+    elif data == "admin:panel":
+        if user_id not in ADMIN_IDS:
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        pending_info = (
+            f"⏳ Запланировано очисток: {sum(1 for t in pending_clears.values() if not t.done())}"
+            if pending_clears else ""
+        )
+        await query.message.reply_text(
+            f"🔧 *Панель управления очередями*\n{pending_info}",
+            parse_mode="Markdown",
+            reply_markup=admin_panel_keyboard(),
+        )
+
+    elif data == "admin:cancel_clears":
+        if user_id not in ADMIN_IDS:
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        cancelled = sum(1 for t in pending_clears.values() if not t.done() and not t.cancel())
+        pending_clears.clear()
+        await query.answer(f"✅ Отменено: {cancelled} задач.", show_alert=True)
+
+    elif data == "admin:close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+    # ── Очистка очередей (честная, с задержкой) ───────────────────────
+    elif data.startswith("clear:"):
+        if user_id not in ADMIN_IDS:
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+
+        parts    = data.split(":")          # ["clear", subject, subgroup]
+        subject  = parts[1] if len(parts) > 1 and parts[1] else None
+        subgroup = parts[2] if len(parts) > 2 and parts[2] else None
+
+        if subject == "all":
+            subject = None
+
+        delay = await schedule_clear(context.application, subject, subgroup)
+        if delay == -1:
+            await query.answer("⏳ Очистка уже запланирована!", show_alert=True)
+        else:
+            mins = delay // 60
+            secs = delay % 60
+            time_str = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+            await query.answer(
+                f"⏰ Очистка запланирована!\nПроизойдёт через ~{time_str}.",
+                show_alert=True,
+            )
+            await query.message.reply_text(
+                f"⏰ Очистка запланирована. Произойдёт в случайный момент "
+                f"в течение *{FAIR_CLEAR_DELAY // 60} минут*.\n"
+                f"Чтобы отменить: нажми «Отмена запланированных» или `/cancel_clears`",
+                parse_mode="Markdown",
+            )
+
+# ══════════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ══════════════════════════════════════════════════════════════════════
+
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # 0. Anti-Spam Middleware (выполняется до команд)
-    app.add_handler(TypeHandler(Update, anti_spam_middleware), group=-1)
-
-    # Общие команды
+    # Общие
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help",  cmd_start))
     app.add_handler(CommandHandler("queue", cmd_queue))
-    app.add_handler(CommandHandler("leave", cmd_leave))
 
-    # Extra очередь
-    app.add_handler(CommandHandler("extra", cmd_extra))
-    app.add_handler(CommandHandler("leave_extra", cmd_leave_extra))
+    # Принудительная запись
+    app.add_handler(CommandHandler("add_oaip", cmd_add_oaip))
+    app.add_handler(CommandHandler("add_chm",  cmd_add_chm))
+    app.add_handler(CommandHandler("add_aisd", cmd_add_aisd))
 
-    # Кнопки "Не успел сдать"
-    app.add_handler(CallbackQueryHandler(btn_missed_lab, pattern="^missed_"))
+    # Администратор
+    app.add_handler(CommandHandler("remove",         cmd_remove))
+    app.add_handler(CommandHandler("cancel_clears",  cmd_cancel_clears))
 
-    # Админские команды
-    app.add_handler(CommandHandler("clear", cmd_clear_subject))  # Переработан под отложенный вызов
+    # Inline-кнопки
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Парсинг текста
+    # Парсинг сообщений группы
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_message))
 
-    logger.info("Бот с новой архитектурой запущен!")
+    logger.info("Бот запущен (v2.0)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
