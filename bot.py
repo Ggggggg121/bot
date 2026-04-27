@@ -4,6 +4,7 @@ v2.0 — приоритеты, антиспам, честная очистка, 
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -37,7 +38,19 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
+
+# Главный администратор (задаётся через переменную окружения на Railway)
+_ENV_ADMIN_ID = int(os.environ["ADMIN_ID"])
+
+# Дополнительные администраторы (хардкод)
+_EXTRA_ADMIN_IDS: frozenset[int] = frozenset({855465799, 1158705019})
+
+# Итоговый набор всех админов
+ADMIN_IDS: frozenset[int] = _EXTRA_ADMIN_IDS | {_ENV_ADMIN_ID}
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором."""
+    return user_id in ADMIN_IDS
 
 SUBJECTS = ["оаип", "чм", "аисд"]
 SUBGROUPS = ["1", "2"]
@@ -189,24 +202,8 @@ def format_all_queues(queues: dict, extra: list) -> str:
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ (только для админа)
 # ══════════════════════════════════════════════════════════════════════
-
-def main_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
-    rows = []
-    for subj in SUBJECTS:
-        rows.append([
-            InlineKeyboardButton(f"😞 Не успел: {subj.upper()}", callback_data=f"miss:{subj}"),
-            InlineKeyboardButton(f"🚪 Выйти: {subj.upper()}", callback_data=f"leave:{subj}"),
-        ])
-    rows.append([
-        InlineKeyboardButton("📝 Extra: записаться", callback_data="extra:join"),
-        InlineKeyboardButton("🚪 Extra: выйти",      callback_data="extra:leave"),
-    ])
-    if is_admin:
-        rows.append([InlineKeyboardButton("🔧 Панель управления", callback_data="admin:panel")])
-    return InlineKeyboardMarkup(rows)
-
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("🗑 Очистить ВСЁ", callback_data="clear:all:")]]
     for subj in SUBJECTS:
@@ -363,10 +360,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 *Бот управления очередями на сдачу лаб*\n\n"
         "📌 *Записаться* — напиши в группе:\n"
         "`занимаю место на оаип` (или чм / аисд)\n\n"
-        "📋 /queue — очереди + кнопки управления\n\n"
+        "📋 /queue — показать все очереди\n\n"
+        "🙅 *Не успел(а)?*\n"
+        "/miss `оаип|чм|аисд` — получить приоритет на следующую сессию\n\n"
+        "🚪 *Выйти из очереди:*\n"
+        "/leave `оаип|чм|аисд` — выйти из обычной очереди\n\n"
+        "🎓 *Extra-очередь:*\n"
+        "/extra — записаться\n"
+        "/leave\\_extra — выйти\n\n"
         "🔧 *Команды администратора:*\n"
+        "/admin — панель управления\n"
         "/remove `<предмет> <пг> <user_id>` — убрать из конкретной очереди\n"
-        "/clear\\_user `<user_id>` — удалить человека ИЗ ВСЕХ очередей\n"
+        "/clear\\_user `<user_id>` — удалить человека ИЗО ВСЕХ очередей\n"
         "/clear\\_sub `<1|2>` — очистить подгруппу (с задержкой)\n"
         "/clear\\_subject `<предмет> [пг]` — очистить предмет (с задержкой)\n"
         "/cancel\\_clears — отменить запланированные очистки",
@@ -378,7 +383,6 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         format_all_queues(load_queues(), load_extra()),
         parse_mode="Markdown",
-        reply_markup=main_keyboard(update.effective_user.id == ADMIN_ID),
     )
 
 # ══════════════════════════════════════════════════════════════════════
@@ -415,8 +419,9 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # ══════════════════════════════════════════════════════════════════════
 
 def admin_only(func):
+    @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID:
+        if not is_admin(update.effective_user.id):
             await update.effective_message.reply_text("❌ Недостаточно прав.")
             return
         await func(update, context)
@@ -534,82 +539,145 @@ async def cmd_cancel_clears(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.effective_message.reply_text(f"✅ Отменено запланированных очисток: *{cancelled}*.", parse_mode="Markdown")
 
 # ══════════════════════════════════════════════════════════════════════
-# ОБРАБОТЧИК INLINE-КНОПОК
+# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ (заменяют inline-кнопки)
+# ══════════════════════════════════════════════════════════════════════
+
+async def cmd_miss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/miss <предмет> — получить приоритет за пропуск."""
+    if not context.args:
+        await update.effective_message.reply_text("Использование: `/miss оаип|чм|аисд`", parse_mode="Markdown")
+        return
+    subject = context.args[0].lower()
+    if subject not in SUBJECTS:
+        await update.effective_message.reply_text(f"❌ Доступные предметы: {', '.join(SUBJECTS)}")
+        return
+
+    user_id = update.effective_user.id
+    muted, secs = check_spam(user_id)
+    if muted:
+        await update.effective_message.reply_text(f"🚫 Мут {secs} сек. за спам.")
+        return
+
+    student = load_students().get(str(user_id))
+    if not student:
+        await update.effective_message.reply_text("❌ Твой ID не найден в базе. Обратись к администратору.")
+        return
+
+    subgroup = str(student["subgroup"])
+    name = f"{student['name']} {student['surname']}"
+    priority = load_priority()
+    pool = priority[subject][subgroup]
+
+    existing = next((pe for pe in pool if pe["user_id"] == user_id), None)
+    if existing:
+        existing["priority_level"] += 1
+        level = existing["priority_level"]
+    else:
+        pool.append({"user_id": user_id, "name": name, "priority_level": 1})
+        level = 1
+
+    priority[subject][subgroup] = pool
+    save_priority(priority)
+    await update.effective_message.reply_text(
+        f"⭐ *{name}*, приоритет на *{subject.upper()}* → уровень {level}.\n"
+        f"В следующую сессию попадёшь в начало очереди.",
+        parse_mode="Markdown",
+    )
+
+async def cmd_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/leave <предмет> — выйти из очереди."""
+    if not context.args:
+        await update.effective_message.reply_text("Использование: `/leave оаип|чм|аисд`", parse_mode="Markdown")
+        return
+    subject = context.args[0].lower()
+    if subject not in SUBJECTS:
+        await update.effective_message.reply_text(f"❌ Доступные предметы: {', '.join(SUBJECTS)}")
+        return
+
+    user_id = update.effective_user.id
+    student = load_students().get(str(user_id))
+    if not student:
+        await update.effective_message.reply_text("❌ Твой ID не найден в базе.")
+        return
+
+    subgroup = str(student["subgroup"])
+    queues = load_queues()
+    old_len = len(queues[subject][subgroup])
+    queues[subject][subgroup] = [e for e in queues[subject][subgroup] if e["user_id"] != user_id]
+
+    if len(queues[subject][subgroup]) == old_len:
+        await update.effective_message.reply_text(f"ℹ️ Ты не записан(а) на *{subject.upper()}*.", parse_mode="Markdown")
+        return
+
+    save_queues(queues)
+    await update.effective_message.reply_text(f"✅ Ты вышел(а) из очереди *{subject.upper()}*.", parse_mode="Markdown")
+
+async def cmd_extra_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/extra — записаться в Extra-очередь."""
+    user_id = update.effective_user.id
+    muted, secs = check_spam(user_id)
+    if muted:
+        await update.effective_message.reply_text(f"🚫 Мут {secs} сек. за спам.")
+        return
+
+    student = load_students().get(str(user_id))
+    if not student:
+        await update.effective_message.reply_text("❌ Твой ID не найден в базе.")
+        return
+
+    extra = load_extra()
+    if any(e["user_id"] == user_id for e in extra):
+        await update.effective_message.reply_text("⚠️ Ты уже в Extra-очереди.")
+        return
+    if len(extra) >= EXTRA_QUEUE_MAX:
+        await update.effective_message.reply_text(f"❌ Extra-очередь заполнена ({EXTRA_QUEUE_MAX} мест).")
+        return
+
+    extra.append({
+        "user_id": user_id,
+        "name": f"{student['name']} {student['surname']}",
+        "time": datetime.now().strftime("%H:%M  %d.%m.%Y"),
+        "priority": 0,
+    })
+    save_extra(extra)
+    await update.effective_message.reply_text(f"✅ Записан(а) в Extra-очередь! Позиция: *{len(extra)}*", parse_mode="Markdown")
+
+async def cmd_extra_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/leave_extra — выйти из Extra-очереди."""
+    user_id = update.effective_user.id
+    extra = load_extra()
+    new_extra = [e for e in extra if e["user_id"] != user_id]
+    if len(new_extra) == len(extra):
+        await update.effective_message.reply_text("ℹ️ Ты не в Extra-очереди.")
+        return
+    save_extra(new_extra)
+    await update.effective_message.reply_text("✅ Ты вышел(а) из Extra-очереди.")
+
+@admin_only
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/admin — открыть панель управления."""
+    pending_info = f"⏳ Запланировано очисток: {sum(1 for t in pending_clears.values() if not t.done())}" if pending_clears else ""
+    await update.effective_message.reply_text(
+        f"🔧 *Панель управления*\n{pending_info}",
+        parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ОБРАБОТЧИК INLINE-КНОПОК (только для админа)
 # ══════════════════════════════════════════════════════════════════════
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query, user_id, data = update.callback_query, update.callback_query.from_user.id, update.callback_query.data
     await query.answer()
 
-    if data.startswith("miss:"):
-        subject = data.split(":")[1]
-        muted, secs = check_spam(user_id)
-        if muted:
-            await query.answer(f"🚫 Мут {secs} сек. за спам.", show_alert=True)
-            return
+    if not is_admin(user_id):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
 
-        student = load_students().get(str(user_id))
-        if not student:
-            await query.answer("❌ Твой ID не найден в базе.", show_alert=True)
-            return
-
-        subgroup, name = str(student["subgroup"]), f"{student['name']} {student['surname']}"
-        priority, pool = load_priority(), load_priority()[subject][str(student["subgroup"])]
-
-        existing = next((pe for pe in pool if pe["user_id"] == user_id), None)
-        if existing: existing["priority_level"], level = existing["priority_level"] + 1, existing["priority_level"] + 1
-        else: pool.append({"user_id": user_id, "name": name, "priority_level": 1}); level = 1
-
-        priority[subject][subgroup] = pool
-        save_priority(priority)
-        await query.answer(f"⭐ Приоритет на {subject.upper()} → уровень {level}.\nВ следующую сессию попадёшь в начало очереди.", show_alert=True)
-
-    elif data.startswith("leave:"):
-        subject = data.split(":")[1]
-        student = load_students().get(str(user_id))
-        if not student:
-            await query.answer("❌ Твой ID не найден.", show_alert=True)
-            return
-
-        subgroup = str(student["subgroup"])
-        queues, old_len = load_queues(), len(load_queues()[subject][subgroup])
-        queues[subject][subgroup] = [e for e in queues[subject][subgroup] if e["user_id"] != user_id]
-
-        if len(queues[subject][subgroup]) == old_len:
-            await query.answer(f"ℹ️ Ты не записан(а) на {subject.upper()}.", show_alert=True)
-            return
-
-        save_queues(queues)
-        await query.answer(f"✅ Ты вышел(а) из очереди {subject.upper()}.", show_alert=True)
-
-    elif data == "extra:join":
-        muted, secs = check_spam(user_id)
-        if muted: return await query.answer(f"🚫 Мут {secs} сек.", show_alert=True)
-        student = load_students().get(str(user_id))
-        if not student: return await query.answer("❌ Твой ID не найден.", show_alert=True)
-
-        extra = load_extra()
-        if any(e["user_id"] == user_id for e in extra): return await query.answer("⚠️ Ты уже в Extra-очереди.", show_alert=True)
-        if len(extra) >= EXTRA_QUEUE_MAX: return await query.answer(f"❌ Очередь заполнена ({EXTRA_QUEUE_MAX}).", show_alert=True)
-
-        extra.append({"user_id": user_id, "name": f"{student['name']} {student['surname']}", "time": datetime.now().strftime("%H:%M  %d.%m.%Y"), "priority": 0})
-        save_extra(extra)
-        await query.answer(f"✅ Записан(а) в Extra! Позиция: {len(extra)}", show_alert=True)
-
-    elif data == "extra:leave":
-        extra = load_extra()
-        new_extra = [e for e in extra if e["user_id"] != user_id]
-        if len(new_extra) == len(extra): return await query.answer("ℹ️ Ты не в Extra-очереди.", show_alert=True)
-        save_extra(new_extra)
-        await query.answer("✅ Ты вышел(а) из Extra-очереди.", show_alert=True)
-
-    elif data == "admin:panel":
-        if user_id != ADMIN_ID: return await query.answer("❌ Нет прав.", show_alert=True)
-        pending_info = f"⏳ Запланировано очисток: {sum(1 for t in pending_clears.values() if not t.done())}" if pending_clears else ""
-        await query.message.reply_text(f"🔧 *Панель управления*\n{pending_info}", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
-
-    elif data == "admin:cancel_clears":
-        if user_id != ADMIN_ID: return await query.answer("❌ Нет прав.", show_alert=True)
+    if data == "admin:cancel_clears":
         cancelled = sum(1 for t in pending_clears.values() if not t.done() and not t.cancel())
         pending_clears.clear()
         await query.answer(f"✅ Отменено: {cancelled} задач.", show_alert=True)
@@ -619,12 +687,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception: pass
 
     elif data.startswith("clear:"):
-        if user_id != ADMIN_ID: return await query.answer("❌ Нет прав.", show_alert=True)
         parts = data.split(":")
-        subject, subgroup = (parts[1] if parts[1] != "all" else None), (parts[2] if len(parts) > 2 and parts[2] else None)
+        subject  = parts[1] if parts[1] != "all" else None
+        subgroup = parts[2] if len(parts) > 2 and parts[2] else None
 
         delay = await schedule_clear(context.application, subject, subgroup)
-        if delay == -1: await query.answer("⏳ Очистка уже запланирована!", show_alert=True)
+        if delay == -1:
+            await query.answer("⏳ Очистка уже запланирована!", show_alert=True)
         else:
             time_str = f"{delay // 60} мин {delay % 60} сек" if delay >= 60 else f"{delay} сек"
             await query.answer(f"⏰ Очистка запланирована через ~{time_str}.", show_alert=True)
@@ -640,15 +709,24 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("queue", cmd_queue))
 
+    # Пользовательские команды (вместо inline-кнопок)
+    app.add_handler(CommandHandler("miss",       cmd_miss))
+    app.add_handler(CommandHandler("leave",      cmd_leave))
+    app.add_handler(CommandHandler("extra",      cmd_extra_join))
+    app.add_handler(CommandHandler("leave_extra", cmd_extra_leave))
+
+    # Команды принудительного добавления (только для админа)
     app.add_handler(CommandHandler("add_oaip", cmd_add_oaip))
     app.add_handler(CommandHandler("add_chm",  cmd_add_chm))
     app.add_handler(CommandHandler("add_aisd", cmd_add_aisd))
 
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("clear_user", cmd_clear_user))
-    app.add_handler(CommandHandler("clear_sub", cmd_clear_sub))
-    app.add_handler(CommandHandler("clear_subject", cmd_clear_subject))
-    app.add_handler(CommandHandler("cancel_clears", cmd_cancel_clears))
+    # Команды администратора
+    app.add_handler(CommandHandler("admin",          cmd_admin))
+    app.add_handler(CommandHandler("remove",         cmd_remove))
+    app.add_handler(CommandHandler("clear_user",     cmd_clear_user))
+    app.add_handler(CommandHandler("clear_sub",      cmd_clear_sub))
+    app.add_handler(CommandHandler("clear_subject",  cmd_clear_subject))
+    app.add_handler(CommandHandler("cancel_clears",  cmd_cancel_clears))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_message))
