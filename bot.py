@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = set(int(x.strip()) for x in os.environ["ADMIN_IDS"].split(","))
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 SUBJECTS = ["оаип", "чм", "аисд"]
 SUBGROUPS = ["1", "2"]
@@ -498,7 +498,7 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     queues = load_queues()
     extra  = load_extra()
     text   = format_all_queues(queues, extra)
-    is_admin = update.effective_user.id in ADMIN_IDS
+    is_admin = update.effective_user.id == ADMIN_ID
 
     await update.effective_message.reply_text(
         text,
@@ -570,7 +570,7 @@ async def _force_add(update: Update, context: ContextTypes.DEFAULT_TYPE, subject
 
     target_id = caller_id
     if context.args:
-        if caller_id not in ADMIN_IDS:
+        if caller_id != ADMIN_ID:
             await update.effective_message.reply_text("❌ Только администратор может записывать других.")
             return
         try:
@@ -599,7 +599,7 @@ async def cmd_add_aisd(u, c): await _force_add(u, c, "аисд")
 
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
+        if update.effective_user.id != ADMIN_ID:
             await update.effective_message.reply_text("❌ Недостаточно прав.")
             return
         await func(update, context)
@@ -778,7 +778,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ── Панель администратора ─────────────────────────────────────────
     elif data == "admin:panel":
-        if user_id not in ADMIN_IDS:
+        if user_id != ADMIN_ID:
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         pending_info = (
@@ -792,7 +792,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif data == "admin:cancel_clears":
-        if user_id not in ADMIN_IDS:
+        if user_id != ADMIN_ID:
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         cancelled = sum(1 for t in pending_clears.values() if not t.done() and not t.cancel())
@@ -807,7 +807,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ── Очистка очередей (честная, с задержкой) ───────────────────────
     elif data.startswith("clear:"):
-        if user_id not in ADMIN_IDS:
+        if user_id != ADMIN_ID:
             await query.answer("❌ Нет прав.", show_alert=True)
             return
 
