@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 
-DATA_DIR = os.environ.get("DATA_DIR", ".")  # /app/data на Railway
+# DATA_DIR — путь к папке с данными (на Railway = /app/data через Volume)
+# Если переменная не задана, используем текущую директорию (локально)
+DATA_DIR = os.environ.get("DATA_DIR", ".")
 STUDENTS_FILE = os.path.join(DATA_DIR, "students.json")
 QUEUES_FILE   = os.path.join(DATA_DIR, "queues.json")
 PRIORITY_FILE = os.path.join(DATA_DIR, "priority_data.json")
@@ -776,6 +778,15 @@ async def cmd_clear_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ──────────────────────────────────────────────
 
 def main() -> None:
+    # При старте копируем students.json из репо в Volume (только на Railway)
+    if DATA_DIR != ".":
+        import shutil
+        if not os.path.exists(STUDENTS_FILE) and os.path.exists("students.json"):
+            shutil.copy("students.json", STUDENTS_FILE)
+            logger.info(f"students.json скопирован в {STUDENTS_FILE}")
+        elif not os.path.exists(STUDENTS_FILE):
+            logger.error("КРИТИЧНО: students.json не найден ни в репо, ни в Volume!")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Общие команды
