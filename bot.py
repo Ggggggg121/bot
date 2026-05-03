@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import time
+import asyncio
 from collections import defaultdict
 from datetime import datetime
 
@@ -547,6 +548,53 @@ def _admin_only(func):
 
 
 @_admin_only
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/broadcast <сообщение> — отправить сообщение всем студентам в ЛС."""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Напиши сообщение после команды.\n"
+            "Пример: /broadcast Ребята, завтра лабы отменяются!",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Получаем весь текст после команды /broadcast
+    text = update.message.text.split(maxsplit=1)[1]
+
+    students = load_students()
+    success_count = 0
+    fail_count = 0
+
+    await update.message.reply_text(f"⏳ Начинаю рассылку для {len(students)} студентов...")
+
+    for uid_str in students.keys():
+        try:
+            user_id = int(uid_str)
+            # Отправляем сообщение
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📢 *Объявление:*\n\n{text}",
+                parse_mode="Markdown"
+            )
+            success_count += 1
+
+            # Небольшая пауза, чтобы Telegram не забанил бота за спам (Flood Wait)
+            await asyncio.sleep(0.05)
+
+        except Exception as e:
+            # Сюда попадут те, кто не запустил бота в ЛС или заблокировал его
+            logger.warning(f"Не удалось отправить рассылку пользователю {uid_str}: {e}")
+            fail_count += 1
+
+    # Отчет администратору
+    await update.message.reply_text(
+        f"✅ *Рассылка завершена!*\n\n"
+        f"Успешно доставлено: *{success_count}*\n"
+        f"Не доставлено: *{fail_count}* _(люди не запустили бота в ЛС или заблокировали его)_",
+        parse_mode="Markdown"
+    )
+
+@_admin_only
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/remove <предмет> <подгруппа> <user_id>"""
     if len(context.args) < 3:
@@ -804,6 +852,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add_aisd", cmd_add_aisd))
 
     # Команды администратора
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("clear_all", cmd_clear_all))
     app.add_handler(CommandHandler("clear_sub", cmd_clear_sub))
